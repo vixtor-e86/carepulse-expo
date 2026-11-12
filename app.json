@@ -1,24 +1,57 @@
 {
   "expo": {
-    "name": "carepulse-expo",
+    "name": "CarePulse",
     "slug": "carepulse-expo",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.carepulse.health",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "CarePulse connects to your ESP32-S3 Watch over Bluetooth Low Energy to stream live heart rate, blood oxygen, and temperature."
+      }
     },
     "android": {
+      "package": "com.carepulse.health",
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.INTERNET"
+      ],
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#08080A",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       }
     },
+    "plugins": [
+      "expo-sqlite",
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+          "modes": [
+            "peripheral",
+            "central"
+          ],
+          "bluetoothAlwaysPermission": "Allow CarePulse to connect to your CarePulse Watch over Bluetooth."
+        }
+      ]
+    ],
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "e8f2c9dc-f7e9-4e17-ba61-d09854303ff8"
+      }
+    },
+    "owner": "vixtor_dev"
   }
 }
