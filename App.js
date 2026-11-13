@@ -8,12 +8,14 @@ import {
   TextInput,
   SafeAreaView,
   StatusBar,
-  Platform
+  Platform,
+  useWindowDimensions
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import Svg, { Path, Defs, LinearGradient as SvgGradient, Stop, Circle, Line } from 'react-native-svg';
 import {
   getDb,
+  clearLocalReadings,
   saveLocalReading,
   getLocalReadings,
   getLocalAlerts,
@@ -32,32 +34,44 @@ import {
   UserIcon,
   SettingsIcon,
   ChevronLeftIcon,
-  MoreIcon,
   BluetoothIcon,
   TrashIcon
 } from './src/components/Icons';
 
+const TAB_KEYS = ['vitals', 'history', 'contacts', 'doctor', 'settings'];
+
+const TAB_TITLES = {
+  vitals: 'Live Vitals',
+  history: 'Telemetry Log',
+  contacts: 'Emergency Contacts',
+  doctor: 'Clinical Team',
+  settings: 'Device Settings'
+};
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState('vitals'); // 'vitals' | 'history' | 'contacts' | 'doctor' | 'settings'
-  const [subTab, setSubTab] = useState('overview'); // 'overview' | 'charts' | 'presets'
+  const { width: screenWidth } = useWindowDimensions();
+  const pagerRef = useRef(null);
+
+  const [activeTab, setActiveTab] = useState('vitals');
 
   const [backendUrl, setBackendUrl] = useState('http://192.168.137.1:8000');
   const [urlInput, setUrlInput] = useState('http://192.168.137.1:8000');
 
+  // Zero mock values: starts empty until live watch telemetry arrives
   const [vitals, setVitals] = useState({
-    heartRate: 74,
-    spo2: 98.4,
-    temperature: 36.6,
-    source: 'watch_ble'
+    heartRate: null,
+    spo2: null,
+    temperature: null,
+    finger: false,
+    source: 'none'
   });
 
-  const [hrTrend, setHrTrend] = useState([
-    72, 74, 73, 75, 74, 76, 74, 73, 75, 74, 72, 74, 75, 74, 76, 75, 74, 73, 74, 74
-  ]);
+  const [hrTrend, setHrTrend] = useState([]);
 
   const [watchConnected, setWatchConnected] = useState(false);
-  const [watchLinkName, setWatchLinkName] = useState('Standby');
+  const [watchLinkName, setWatchLinkName] = useState('Not Connected');
   const [bleNotice, setBleNotice] = useState('');
+  const [lastPacketTime, setLastPacketTime] = useState(null);
 
   const [activeAlert, setActiveAlert] = useState(null);
   const [countdown, setCountdown] = useState(60);
@@ -70,14 +84,34 @@ export default function App() {
     relationship: 'Family',
     phone: ''
   });
-  const [scenario, setScenario] = useState('normal');
 
   const backendUrlRef = useRef(backendUrl);
   useEffect(() => {
     backendUrlRef.current = backendUrl;
   }, [backendUrl]);
 
-  // Initialize Local SQLite DB on Launch
+  // Navigate to a tab via tap or back button and scroll the horizontal pager
+  const goToTab = (tabKey) => {
+    const idx = TAB_KEYS.indexOf(tabKey);
+    if (idx === -1) return;
+    setActiveTab(tabKey);
+    if (pagerRef.current && screenWidth > 0) {
+      pagerRef.current.scrollTo({ x: idx * screenWidth, animated: true });
+    }
+  };
+
+  // Sync activeTab when user swipes horizontally between pages
+  const handleSwipeScrollEnd = (e) => {
+    if (!screenWidth) return;
+    const offsetX = e.nativeEvent.contentOffset.x;
+    const pageIndex = Math.round(offsetX / screenWidth);
+    const nextTab = TAB_KEYS[pageIndex];
+    if (nextTab && nextTab !== activeTab) {
+      setActiveTab(nextTab);
+    }
+  };
+
+  // Initialize Local SQLite DB on Launch (purges any legacy mock readings)
   useEffect(() => {
     (async () => {
       await getDb();
@@ -89,62 +123,75 @@ export default function App() {
   }, []);
 
   const refreshFromLocalDb = async () => {
-    const readings = await getLocalReadings(30);
-    if (readings && readings.length > 0) {
-      setHistoryList(readings);
-      const latest = readings[0];
-      setVitals({
-        heartRate: latest.heart_rate,
-        spo2: latest.spo2,
-        temperature: latest.temperature,
-        source: latest.source
-      });
-    }
+    const readings = await getLocalReadings(40);
+    setHistoryList(readings || []);
+
     const alerts = await getLocalAlerts();
-    setAlertsList(alerts);
-    const pending = alerts.find(
+    setAlertsList(alerts || []);
+    const pending = (alerts || []).find(
       a => a.status === 'PENDING_PATIENT_ACK' || a.status === 'ESCALATED_TO_DOCTOR'
     );
-    if (pending) {
-      setActiveAlert(pending);
-    }
+    setActiveAlert(pending || null);
+
     const cts = await getLocalContacts();
-    setContacts(cts);
+    setContacts(cts || []);
   };
 
-  // Record a new reading into Local SQLite DB + Sync to Backend if reachable
+  // Process a live hardware reading from the CarePulse Watch
   const recordVitalReading = async (hr, spo2, temp, source = 'watch_ble', finger = true) => {
-    setVitals({ heartRate: hr, spo2, temperature: temp, source });
-    setHrTrend(prev => [...prev.slice(1), Math.round(hr)]);
+    const validHr = finger && hr > 0 ? Number(hr) : null;
+    const validSpo2 = finger && spo2 > 0 ? Number(spo2) : null;
+    const validTemp = temp > 0 ? Number(temp) : null;
 
-    const createdAlert = await saveLocalReading(hr, spo2, temp, source, finger);
+    setVitals({
+      heartRate: validHr,
+      spo2: validSpo2,
+      temperature: validTemp,
+      finger,
+      source
+    });
+    setLastPacketTime(new Date().toLocaleTimeString());
+
+    if (validHr !== null) {
+      setHrTrend(prev => [...prev.slice(-19), Math.round(validHr)]);
+    }
+
+    const createdAlert = await saveLocalReading(
+      validHr || 0,
+      validSpo2 || 0,
+      validTemp || 0,
+      source,
+      finger
+    );
     if (createdAlert) {
       setActiveAlert(createdAlert);
       setCountdown(60);
     }
     await refreshFromLocalDb();
 
-    // Optional sync to PC Doctor Portal if connected on Wi-Fi / Hotspot
-    try {
-      await fetch(`${backendUrlRef.current}/api/readings/ingest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          patient_id: 2,
-          heart_rate: Math.round(hr),
-          spo2: Number(spo2.toFixed(1)),
-          temperature: Number(temp.toFixed(1)),
-          is_simulated: source === 'scenario',
-          reading_source: source,
-          finger
-        })
-      });
-    } catch (e) {
-      // Offline mode: local SQLite DB already persisted the reading
+    // Optional sync to PC Doctor Portal if reachable
+    if (validHr !== null || validTemp !== null) {
+      try {
+        await fetch(`${backendUrlRef.current}/api/readings/ingest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            patient_id: 2,
+            heart_rate: validHr ? Math.round(validHr) : 0,
+            spo2: validSpo2 ? Number(validSpo2.toFixed(1)) : 0,
+            temperature: validTemp ? Number(validTemp.toFixed(1)) : 0,
+            is_simulated: false,
+            reading_source: source,
+            finger
+          })
+        });
+      } catch (e) {
+        // Offline mode: reading is already saved in on-device SQLite
+      }
     }
   };
 
-  // Poll Backend if Watch is plugged into PC USB instead of Phone BLE
+  // Poll Backend ONLY if Watch is connected to PC USB and NOT connected via Phone BLE
   useEffect(() => {
     const poll = setInterval(async () => {
       if (watchConnected && watchLinkName.includes('BLE')) return;
@@ -152,22 +199,25 @@ export default function App() {
         const res = await fetch(`${backendUrlRef.current}/api/readings/latest/2`);
         if (res.ok) {
           const data = await res.json();
-          if (data && data.heart_rate) {
+          if (data && data.watch_connected && !data.is_simulated) {
+            const finger = data.finger !== undefined ? Boolean(data.finger) : true;
+            setWatchConnected(true);
+            setWatchLinkName(data.watch_port ? `${data.watch_port} (USB)` : 'Host USB');
             setVitals({
-              heartRate: data.heart_rate,
-              spo2: data.spo2,
-              temperature: data.temperature,
-              source: data.reading_source || 'server_sync'
+              heartRate: finger && data.heart_rate > 0 ? Number(data.heart_rate) : null,
+              spo2: finger && data.spo2 > 0 ? Number(data.spo2) : null,
+              temperature: data.temperature > 0 ? Number(data.temperature) : null,
+              finger,
+              source: 'watch_usb'
             });
-            setHrTrend(prev => [...prev.slice(1), Math.round(data.heart_rate)]);
-            if (data.watch_connected) {
-              setWatchConnected(true);
-              setWatchLinkName(data.watch_port || 'Host USB');
+            setLastPacketTime(new Date().toLocaleTimeString());
+            if (finger && data.heart_rate > 0) {
+              setHrTrend(prev => [...prev.slice(-19), Math.round(data.heart_rate)]);
             }
           }
         }
       } catch (e) {}
-    }, 2500);
+    }, 2000);
     return () => clearInterval(poll);
   }, [watchConnected, watchLinkName]);
 
@@ -215,7 +265,7 @@ export default function App() {
   };
 
   const handlePairBluetoothWatch = () => {
-    setBleNotice('Scanning for CarePulse Watch...');
+    setBleNotice('Scanning for CarePulse Watch over Bluetooth...');
     connectToCarePulseWatch({
       onConnected: (name) => {
         setWatchConnected(true);
@@ -223,15 +273,22 @@ export default function App() {
         setBleNotice('');
       },
       onTelemetry: (data) => {
-        const hr = Number(data.heart_rate || 72);
-        const spo2 = Number(data.spo2 || 98);
-        const temp = Number(data.temperature || 36.6);
-        const finger = Boolean(data.finger);
+        const finger = data.finger !== undefined ? Boolean(data.finger) : true;
+        const hr = data.heart_rate !== undefined ? Number(data.heart_rate) : 0;
+        const spo2 = data.spo2 !== undefined ? Number(data.spo2) : 0;
+        const temp = data.temperature !== undefined ? Number(data.temperature) : 0;
         recordVitalReading(hr, spo2, temp, 'watch_ble', finger);
       },
       onDisconnected: () => {
         setWatchConnected(false);
         setWatchLinkName('Disconnected');
+        setVitals({
+          heartRate: null,
+          spo2: null,
+          temperature: null,
+          finger: false,
+          source: 'none'
+        });
       },
       onError: (msg) => {
         setBleNotice(msg);
@@ -239,20 +296,21 @@ export default function App() {
     });
   };
 
-  const triggerScenario = (mode) => {
-    setScenario(mode);
-    if (mode === 'tachycardia') recordVitalReading(128, 97.4, 37.0, 'scenario', true);
-    else if (mode === 'low_spo2') recordVitalReading(89, 88.5, 36.7, 'scenario', true);
-    else if (mode === 'fever') recordVitalReading(106, 96.2, 38.8, 'scenario', true);
-    else {
-      setActiveAlert(null);
-      recordVitalReading(74, 98.4, 36.6, 'scenario', true);
-    }
+  const handleClearHistory = async () => {
+    await clearLocalReadings();
+    setHrTrend([]);
+    setActiveAlert(null);
+    await refreshFromLocalDb();
   };
 
   const handleCreateContact = async () => {
     if (!newContact.name.trim() || !newContact.phone.trim()) return;
-    await addLocalContact(newContact.name.trim(), newContact.relationship.trim() || 'Family', newContact.phone.trim(), false);
+    await addLocalContact(
+      newContact.name.trim(),
+      newContact.relationship.trim() || 'Family',
+      newContact.phone.trim(),
+      false
+    );
     setNewContact({ name: '', relationship: 'Family', phone: '' });
     await refreshFromLocalDb();
   };
@@ -268,34 +326,38 @@ export default function App() {
     await saveSetting('backend_url', cleaned);
   };
 
-  // Build SVG Heart Rate Area Chart Path
+  // Build SVG Heart Rate Area Chart Path from Live Watch Readings
   const chartW = 300;
   const chartH = 84;
-  const stepX = chartW / Math.max(1, hrTrend.length - 1);
-  const pointsCoords = hrTrend.map((val, idx) => {
+  const displayTrend = hrTrend.length > 1 ? hrTrend : hrTrend.length === 1 ? [hrTrend[0], hrTrend[0]] : [];
+  const stepX = displayTrend.length > 1 ? chartW / (displayTrend.length - 1) : chartW;
+  const pointsCoords = displayTrend.map((val, idx) => {
     const clamped = Math.max(50, Math.min(180, val));
     const y = chartH - ((clamped - 50) / 130) * (chartH - 16) - 8;
     return { x: idx * stepX, y };
   });
 
-  const linePath = pointsCoords
-    .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`)
-    .join(' ');
-  const areaPath = `${linePath} L ${chartW} ${chartH} L 0 ${chartH} Z`;
+  const linePath =
+    pointsCoords.length > 0
+      ? pointsCoords.map((pt, i) => `${i === 0 ? 'M' : 'L'} ${pt.x.toFixed(1)} ${pt.y.toFixed(1)}`).join(' ')
+      : '';
+  const areaPath = linePath ? `${linePath} L ${chartW} ${chartH} L 0 ${chartH} Z` : '';
 
-  const isHrAbnormal = vitals.heartRate > 110 || vitals.heartRate < 50;
-  const isSpo2Abnormal = vitals.spo2 < 92.0;
-  const isTempAbnormal = vitals.temperature > 38.0;
+  const hasLiveHr = vitals.heartRate !== null && vitals.heartRate > 0;
+  const hasLiveSpo2 = vitals.spo2 !== null && vitals.spo2 > 0;
+  const hasLiveTemp = vitals.temperature !== null && vitals.temperature > 0;
+
+  const isHrAbnormal = hasLiveHr && (vitals.heartRate > 110 || vitals.heartRate < 50);
+  const isSpo2Abnormal = hasLiveSpo2 && vitals.spo2 < 92.0;
+  const isTempAbnormal = hasLiveTemp && vitals.temperature > 38.0;
   const hasAnomaly = isHrAbnormal || isSpo2Abnormal || isTempAbnormal;
-  const stabilityScore = hasAnomaly ? '4.2' : '9.6';
-
-  const tabTitles = {
-    vitals: 'Live Vitals',
-    history: 'Telemetry Log',
-    contacts: 'Emergency Contacts',
-    doctor: 'Clinical Team',
-    settings: 'Device Settings'
-  };
+  const stabilityScore = !watchConnected
+    ? '--'
+    : !vitals.finger
+    ? 'Wait'
+    : hasAnomaly
+    ? '4.2'
+    : '9.8';
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -303,20 +365,24 @@ export default function App() {
 
       {/* TOP HEADER */}
       <View style={styles.header}>
-        <TouchableOpacity
-          style={styles.circleBtn}
-          onPress={() => setActiveTab('vitals')}
-        >
+        <TouchableOpacity style={styles.circleBtn} onPress={() => goToTab('vitals')}>
           <ChevronLeftIcon size={17} color="#FFFFFF" />
         </TouchableOpacity>
 
-        <Text style={styles.headerTitle}>{tabTitles[activeTab]}</Text>
+        <View style={{ alignItems: 'center' }}>
+          <Text style={styles.headerTitle}>{TAB_TITLES[activeTab]}</Text>
+          <View style={styles.pageDotsRow}>
+            {TAB_KEYS.map(key => (
+              <View
+                key={key}
+                style={[styles.pageDot, activeTab === key && styles.pageDotActive]}
+              />
+            ))}
+          </View>
+        </View>
 
         <TouchableOpacity
-          style={[
-            styles.blePillBtn,
-            watchConnected && styles.blePillBtnActive
-          ]}
+          style={[styles.blePillBtn, watchConnected && styles.blePillBtnActive]}
           onPress={handlePairBluetoothWatch}
         >
           <BluetoothIcon size={13} color={watchConnected ? '#0A0D0A' : '#D4FF47'} />
@@ -326,43 +392,34 @@ export default function App() {
               watchConnected && { color: '#0A0D0A', fontWeight: '700' }
             ]}
           >
-            {watchConnected ? 'Linked' : 'Pair'}
+            {watchConnected ? 'Linked' : 'Pair Watch'}
           </Text>
         </TouchableOpacity>
       </View>
 
-      {/* SUB-TABS */}
-      {activeTab === 'vitals' && (
-        <View style={styles.subTabsBar}>
-          {['overview', 'charts', 'presets'].map(key => (
-            <TouchableOpacity
-              key={key}
-              style={[styles.subTabBtn, subTab === key && styles.subTabBtnActive]}
-              onPress={() => setSubTab(key)}
-            >
-              <Text style={[styles.subTabText, subTab === key && styles.subTabTextActive]}>
-                {key.charAt(0).toUpperCase() + key.slice(1)}
-              </Text>
-            </TouchableOpacity>
-          ))}
+      {bleNotice ? (
+        <View style={[styles.noticeCard, { marginHorizontal: 18, marginBottom: 4 }]}>
+          <Text style={styles.noticeText}>{bleNotice}</Text>
         </View>
-      )}
+      ) : null}
 
-      {/* MAIN CONTENT SCROLL */}
+      {/* HORIZONTAL SWIPEABLE PAGER FOR ALL 5 TABS */}
       <ScrollView
-        style={styles.scrollArea}
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator={false}
+        ref={pagerRef}
+        horizontal
+        pagingEnabled
+        showsHorizontalScrollIndicator={false}
+        onMomentumScrollEnd={handleSwipeScrollEnd}
+        scrollEventThrottle={16}
+        style={styles.pager}
       >
-        {bleNotice ? (
-          <View style={styles.noticeCard}>
-            <Text style={styles.noticeText}>{bleNotice}</Text>
-          </View>
-        ) : null}
-
-        {/* ==================== TAB 1: VITALS ==================== */}
-        {activeTab === 'vitals' && (
-          <>
+        {/* ==================== PAGE 1: LIVE VITALS ==================== */}
+        <View style={{ width: screenWidth }}>
+          <ScrollView
+            style={styles.scrollArea}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
             {/* Active Alert Prompt */}
             {activeAlert && (
               <View style={styles.alertCard}>
@@ -380,10 +437,7 @@ export default function App() {
                 </View>
                 <Text style={styles.alertMessageText}>{activeAlert.message}</Text>
                 {activeAlert.status === 'PENDING_PATIENT_ACK' && (
-                  <TouchableOpacity
-                    style={styles.ackButton}
-                    onPress={handleAcknowledgeAlert}
-                  >
+                  <TouchableOpacity style={styles.ackButton} onPress={handleAcknowledgeAlert}>
                     <Text style={styles.ackButtonText}>Acknowledge Status</Text>
                   </TouchableOpacity>
                 )}
@@ -399,14 +453,20 @@ export default function App() {
             >
               <View style={styles.heroMetaRow}>
                 <Text style={styles.heroMetaText}>
-                  {watchConnected ? `WATCH · ${watchLinkName.toUpperCase()}` : 'LOCAL SQLITE · READY'}
+                  {!watchConnected
+                    ? 'BLUETOOTH DISCONNECTED · TAP PAIR WATCH'
+                    : vitals.finger
+                    ? `${watchLinkName.toUpperCase()} · FINGER ON SENSOR`
+                    : `${watchLinkName.toUpperCase()} · PLACE FINGER ON WATCH`}
                 </Text>
-                <Text style={styles.heroMetaText}>LIVE</Text>
+                <Text style={styles.heroMetaText}>
+                  {watchConnected ? (lastPacketTime || 'LIVE') : 'OFFLINE'}
+                </Text>
               </View>
 
               <Text style={styles.heroLabel}>Blood Oxygen</Text>
               <Text style={styles.heroMainValue}>
-                {Number(vitals.spo2).toFixed(1)}
+                {hasLiveSpo2 ? Number(vitals.spo2).toFixed(1) : '--'}
               </Text>
               <Text style={styles.heroUnit}>Percent SpO2</Text>
 
@@ -414,14 +474,14 @@ export default function App() {
                 <View style={styles.heroSplitCol}>
                   <Text style={styles.heroSubLabel}>Temperature</Text>
                   <Text style={styles.heroSubVal}>
-                    {Number(vitals.temperature).toFixed(1)}
+                    {hasLiveTemp ? Number(vitals.temperature).toFixed(1) : '--'}
                   </Text>
                   <Text style={styles.heroSubUnit}>Celsius</Text>
                 </View>
                 <View style={styles.heroSplitCol}>
                   <Text style={styles.heroSubLabel}>Heart Rate</Text>
                   <Text style={styles.heroSubVal}>
-                    {Math.round(vitals.heartRate)}
+                    {hasLiveHr ? Math.round(vitals.heartRate) : '--'}
                   </Text>
                   <Text style={styles.heroSubUnit}>bpm</Text>
                 </View>
@@ -431,25 +491,52 @@ export default function App() {
             {/* Heart Rate Area Chart Card */}
             <View style={styles.surfaceCard}>
               <View style={styles.cardTopRow}>
-                <Text style={styles.cardTitle}>Heart Rate</Text>
+                <Text style={styles.cardTitle}>Heart Rate Live Stream</Text>
                 <Text style={styles.cardMeta}>
-                  Avg. <Text style={styles.redHighlight}>{Math.round(vitals.heartRate)} bpm</Text>
+                  Current{' '}
+                  <Text style={styles.redHighlight}>
+                    {hasLiveHr ? `${Math.round(vitals.heartRate)} bpm` : '-- bpm'}
+                  </Text>
                 </Text>
               </View>
 
               <View style={styles.chartWrapper}>
-                <Svg width="100%" height={chartH} viewBox={`0 0 ${chartW} ${chartH}`}>
-                  <Defs>
-                    <SvgGradient id="hrGrad" x1="0" y1="0" x2="0" y2="1">
-                      <Stop offset="0" stopColor="#FF4D4D" stopOpacity="0.35" />
-                      <Stop offset="1" stopColor="#FF4D4D" stopOpacity="0.0" />
-                    </SvgGradient>
-                  </Defs>
-                  <Line x1="0" y1="16" x2={chartW} y2="16" stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
-                  <Line x1="0" y1={chartH - 12} x2={chartW} y2={chartH - 12} stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
-                  <Path d={areaPath} fill="url(#hrGrad)" />
-                  <Path d={linePath} fill="none" stroke="#FF4D4D" strokeWidth="2" />
-                </Svg>
+                {linePath ? (
+                  <Svg width="100%" height={chartH} viewBox={`0 0 ${chartW} ${chartH}`}>
+                    <Defs>
+                      <SvgGradient id="hrGrad" x1="0" y1="0" x2="0" y2="1">
+                        <Stop offset="0" stopColor="#FF4D4D" stopOpacity="0.35" />
+                        <Stop offset="1" stopColor="#FF4D4D" stopOpacity="0.0" />
+                      </SvgGradient>
+                    </Defs>
+                    <Line
+                      x1="0"
+                      y1="16"
+                      x2={chartW}
+                      y2="16"
+                      stroke="rgba(255,255,255,0.06)"
+                      strokeWidth="1"
+                    />
+                    <Line
+                      x1="0"
+                      y1={chartH - 12}
+                      x2={chartW}
+                      y2={chartH - 12}
+                      stroke="rgba(255,255,255,0.06)"
+                      strokeWidth="1"
+                    />
+                    <Path d={areaPath} fill="url(#hrGrad)" />
+                    <Path d={linePath} fill="none" stroke="#FF4D4D" strokeWidth="2" />
+                  </Svg>
+                ) : (
+                  <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+                    <Text style={styles.axisLabel}>
+                      {watchConnected
+                        ? 'Place your finger on the watch sensor to plot live BPM...'
+                        : 'Pair CarePulse Watch via Bluetooth to stream live BPM...'}
+                    </Text>
+                  </View>
+                )}
               </View>
 
               <View style={styles.chartAxisRow}>
@@ -461,7 +548,7 @@ export default function App() {
 
             {/* Stability Index Circular Gauge Card */}
             <View style={styles.surfaceCard}>
-              <Text style={[styles.cardTitle, { marginBottom: 12 }]}>Stability Index</Text>
+              <Text style={[styles.cardTitle, { marginBottom: 12 }]}>Sensor Telemetry Status</Text>
               <View style={styles.ringRow}>
                 <View style={styles.ringBox}>
                   <Svg width={68} height={68} viewBox="0 0 68 68">
@@ -477,10 +564,10 @@ export default function App() {
                       cx="34"
                       cy="34"
                       r="28"
-                      stroke={hasAnomaly ? '#FF4D4D' : '#D4FF47'}
+                      stroke={!watchConnected ? '#5C5C66' : hasAnomaly ? '#FF4D4D' : '#D4FF47'}
                       strokeWidth="5"
                       strokeDasharray="175"
-                      strokeDashoffset={hasAnomaly ? '95' : '22'}
+                      strokeDashoffset={!watchConnected ? '175' : hasAnomaly ? '95' : '22'}
                       strokeLinecap="round"
                       fill="none"
                       rotation="-90"
@@ -490,109 +577,110 @@ export default function App() {
                   <View style={styles.ringCenterText}>
                     <Text style={styles.ringScoreText}>{stabilityScore}</Text>
                     <Text style={styles.ringSubText}>
-                      {hasAnomaly ? 'Alert' : 'Optimal'}
+                      {!watchConnected ? 'Idle' : hasAnomaly ? 'Alert' : 'Live'}
                     </Text>
                   </View>
                 </View>
 
                 <Text style={styles.ringDescText}>
-                  {hasAnomaly
+                  {!watchConnected
+                    ? 'Tap "Pair Watch" in the top-right corner to connect directly to your CarePulse Watch over Bluetooth.'
+                    : !vitals.finger
+                    ? 'Bluetooth connected. Place your finger on the MAX30102 sensor to read live Heart Rate & SpO2. Temperature updates continuously.'
+                    : hasAnomaly
                     ? 'Vital parameters outside baseline range. Escalation monitoring is active.'
-                    : 'Cardiorespiratory telemetry is steady and saved to on-device SQLite.'}
+                    : 'Live MAX30102 & MLX90614 watch readings are streaming over Bluetooth and saving to SQLite.'}
                 </Text>
               </View>
             </View>
+          </ScrollView>
+        </View>
 
-            {/* Scenario Filter Pills */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.pillsRow}
-            >
-              {[
-                { key: 'normal', label: 'Baseline' },
-                { key: 'tachycardia', label: 'High BPM' },
-                { key: 'low_spo2', label: 'Low SpO2' },
-                { key: 'fever', label: 'High Temp' }
-              ].map(item => (
-                <TouchableOpacity
-                  key={item.key}
-                  style={[
-                    styles.scenarioPill,
-                    scenario === item.key && styles.scenarioPillActive
-                  ]}
-                  onPress={() => triggerScenario(item.key)}
-                >
-                  <Text
-                    style={[
-                      styles.scenarioPillText,
-                      scenario === item.key && styles.scenarioPillTextActive
-                    ]}
-                  >
-                    {item.label}
+        {/* ==================== PAGE 2: HISTORY (LOCAL SQLITE) ==================== */}
+        <View style={{ width: screenWidth }}>
+          <ScrollView
+            style={styles.scrollArea}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
+            <View style={styles.sectionRow}>
+              <Text style={styles.sectionSub}>On-Device SQLite Watch Log ({historyList.length})</Text>
+              {historyList.length > 0 && (
+                <TouchableOpacity onPress={handleClearHistory}>
+                  <Text style={[styles.sectionSub, { color: '#FF4D4D', fontWeight: '600' }]}>
+                    Clear Log
                   </Text>
                 </TouchableOpacity>
-              ))}
-            </ScrollView>
-          </>
-        )}
-
-        {/* ==================== TAB 2: HISTORY (LOCAL SQLITE) ==================== */}
-        {activeTab === 'history' && (
-          <View>
-            <View style={styles.sectionRow}>
-              <Text style={styles.sectionSub}>On-Device SQLite Records</Text>
-              <Text style={styles.sectionSub}>{historyList.length} entries</Text>
+              )}
             </View>
-            {historyList.map((item, idx) => {
-              const abnormal =
-                item.heart_rate > 110 ||
-                item.heart_rate < 50 ||
-                item.spo2 < 92 ||
-                item.temperature > 38;
-              return (
-                <View key={item.id || idx} style={styles.listRowCard}>
-                  <View>
-                    <Text style={styles.listRowPrimary}>
-                      {item.heart_rate} bpm  ·  {Number(item.spo2).toFixed(1)}%  ·  {Number(item.temperature).toFixed(1)}°C
-                    </Text>
-                    <Text style={styles.listRowSecondary}>
-                      {item.source} · {new Date(item.recorded_at).toLocaleTimeString()}
+            {historyList.length === 0 ? (
+              <View style={styles.surfaceCard}>
+                <Text style={styles.ringDescText}>
+                  No watch readings recorded yet. Connect your CarePulse Watch via Bluetooth to log live sensor data.
+                </Text>
+              </View>
+            ) : (
+              historyList.map((item, idx) => {
+                const abnormal =
+                  (item.heart_rate > 0 && (item.heart_rate > 110 || item.heart_rate < 50)) ||
+                  (item.spo2 > 0 && item.spo2 < 92) ||
+                  item.temperature > 38;
+                return (
+                  <View key={item.id || idx} style={styles.listRowCard}>
+                    <View>
+                      <Text style={styles.listRowPrimary}>
+                        {item.heart_rate > 0 ? `${item.heart_rate} bpm` : '-- bpm'}  ·  {item.spo2 > 0 ? `${Number(item.spo2).toFixed(1)}%` : '--%'}  ·  {item.temperature > 0 ? `${Number(item.temperature).toFixed(1)}°C` : '--°C'}
+                      </Text>
+                      <Text style={styles.listRowSecondary}>
+                        {item.source} · {new Date(item.recorded_at).toLocaleTimeString()}
+                      </Text>
+                    </View>
+                    <Text
+                      style={[
+                        styles.statusTag,
+                        { color: abnormal ? '#FF4D4D' : '#D4FF47' }
+                      ]}
+                    >
+                      {abnormal ? 'Alert' : 'Normal'}
                     </Text>
                   </View>
-                  <Text
-                    style={[
-                      styles.statusTag,
-                      { color: abnormal ? '#FF4D4D' : '#D4FF47' }
-                    ]}
-                  >
-                    {abnormal ? 'Alert' : 'Normal'}
-                  </Text>
-                </View>
-              );
-            })}
-          </View>
-        )}
+                );
+              })
+            )}
+          </ScrollView>
+        </View>
 
-        {/* ==================== TAB 3: EMERGENCY CONTACTS ==================== */}
-        {activeTab === 'contacts' && (
-          <View>
-            {contacts.map(c => (
-              <View key={c.id} style={styles.listRowCard}>
-                <View>
-                  <Text style={styles.listRowPrimary}>{c.name}</Text>
-                  <Text style={styles.listRowSecondary}>
-                    {c.relationship} · {c.phone}
-                  </Text>
-                </View>
-                <TouchableOpacity
-                  style={styles.circleBtn}
-                  onPress={() => handleRemoveContact(c.id)}
-                >
-                  <TrashIcon size={15} color="#8E8E98" />
-                </TouchableOpacity>
+        {/* ==================== PAGE 3: EMERGENCY CONTACTS ==================== */}
+        <View style={{ width: screenWidth }}>
+          <ScrollView
+            style={styles.scrollArea}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
+            {contacts.length === 0 ? (
+              <View style={[styles.surfaceCard, { marginBottom: 10 }]}>
+                <Text style={styles.ringDescText}>
+                  No emergency contacts saved yet. Add a contact below.
+                </Text>
               </View>
-            ))}
+            ) : (
+              contacts.map(c => (
+                <View key={c.id} style={styles.listRowCard}>
+                  <View>
+                    <Text style={styles.listRowPrimary}>{c.name}</Text>
+                    <Text style={styles.listRowSecondary}>
+                      {c.relationship} · {c.phone}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.circleBtn}
+                    onPress={() => handleRemoveContact(c.id)}
+                  >
+                    <TrashIcon size={15} color="#8E8E98" />
+                  </TouchableOpacity>
+                </View>
+              ))
+            )}
 
             <View style={[styles.surfaceCard, { marginTop: 10 }]}>
               <Text style={[styles.cardTitle, { marginBottom: 12 }]}>New Contact</Text>
@@ -621,12 +709,16 @@ export default function App() {
                 <Text style={styles.ackButtonText}>Save to Local DB</Text>
               </TouchableOpacity>
             </View>
-          </View>
-        )}
+          </ScrollView>
+        </View>
 
-        {/* ==================== TAB 4: CLINICAL TEAM ==================== */}
-        {activeTab === 'doctor' && (
-          <View style={{ gap: 12 }}>
+        {/* ==================== PAGE 4: CLINICAL TEAM ==================== */}
+        <View style={{ width: screenWidth }}>
+          <ScrollView
+            style={styles.scrollArea}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
             <View style={styles.surfaceCard}>
               <Text style={styles.overlineVolt}>ASSIGNED PHYSICIAN</Text>
               <Text style={styles.docName}>Dr. Sarah Jenkins, MD</Text>
@@ -641,15 +733,19 @@ export default function App() {
             <View style={styles.surfaceCard}>
               <Text style={[styles.cardTitle, { marginBottom: 6 }]}>Escalation Protocol</Text>
               <Text style={styles.ringDescText}>
-                Unacknowledged alerts automatically escalate to Dr. Sarah Jenkins after 60 seconds and sync with the clinical portal.
+                Unacknowledged alerts automatically escalate after 60 seconds and sync with the clinical portal.
               </Text>
             </View>
-          </View>
-        )}
+          </ScrollView>
+        </View>
 
-        {/* ==================== TAB 5: SETTINGS ==================== */}
-        {activeTab === 'settings' && (
-          <View style={{ gap: 12 }}>
+        {/* ==================== PAGE 5: SETTINGS ==================== */}
+        <View style={{ width: screenWidth }}>
+          <ScrollView
+            style={styles.scrollArea}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
             <View style={styles.surfaceCard}>
               <Text style={[styles.cardTitle, { marginBottom: 8 }]}>Hardware & Storage</Text>
               <Text style={styles.listRowSecondary}>Watch BLE Name: CarePulse Watch</Text>
@@ -657,8 +753,16 @@ export default function App() {
                 On-Device DB: carepulse_mobile.db (SQLite)
               </Text>
               <Text style={[styles.listRowSecondary, { marginTop: 4 }]}>
-                Link Status: {watchConnected ? watchLinkName : 'Standby'}
+                Link Status: {watchConnected ? watchLinkName : 'Not Connected'}
               </Text>
+              <TouchableOpacity
+                style={[styles.ackButton, { marginTop: 12, backgroundColor: '#232329' }]}
+                onPress={handleClearHistory}
+              >
+                <Text style={[styles.ackButtonText, { color: '#FF4D4D' }]}>
+                  Clear Stored Readings
+                </Text>
+              </TouchableOpacity>
             </View>
 
             <View style={styles.surfaceCard}>
@@ -677,8 +781,8 @@ export default function App() {
                 <Text style={styles.ackButtonText}>Save Endpoint</Text>
               </TouchableOpacity>
             </View>
-          </View>
-        )}
+          </ScrollView>
+        </View>
       </ScrollView>
 
       {/* FLOATING PILL BOTTOM NAVIGATION BAR */}
@@ -695,7 +799,7 @@ export default function App() {
             <TouchableOpacity
               key={key}
               style={[styles.navPillItem, isActive && styles.navPillItemActive]}
-              onPress={() => setActiveTab(key)}
+              onPress={() => goToTab(key)}
             >
               <Icon size={19} color={isActive ? '#D4FF47' : '#8E8E98'} />
             </TouchableOpacity>
@@ -735,6 +839,21 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     letterSpacing: -0.2
   },
+  pageDotsRow: {
+    flexDirection: 'row',
+    gap: 5,
+    marginTop: 5
+  },
+  pageDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 2.5,
+    backgroundColor: '#2A2A32'
+  },
+  pageDotActive: {
+    width: 14,
+    backgroundColor: '#D4FF47'
+  },
   blePillBtn: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -755,35 +874,15 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600'
   },
-  subTabsBar: {
-    flexDirection: 'row',
-    paddingHorizontal: 20,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.06)',
-    gap: 24
-  },
-  subTabBtn: {
-    paddingBottom: 10
-  },
-  subTabBtnActive: {
-    borderBottomWidth: 2,
-    borderBottomColor: '#FFFFFF'
-  },
-  subTabText: {
-    color: '#8E8E98',
-    fontSize: 13,
-    fontWeight: '500'
-  },
-  subTabTextActive: {
-    color: '#FFFFFF',
-    fontWeight: '600'
+  pager: {
+    flex: 1
   },
   scrollArea: {
     flex: 1
   },
   scrollContent: {
     paddingHorizontal: 18,
-    paddingTop: 16,
+    paddingTop: 10,
     paddingBottom: 105,
     gap: 12
   },
@@ -799,9 +898,50 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 17
   },
+  alertCard: {
+    backgroundColor: 'rgba(255, 77, 77, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 77, 77, 0.35)',
+    borderRadius: 20,
+    padding: 16
+  },
+  alertTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center'
+  },
+  alertTitleText: {
+    color: '#FF4D4D',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.4
+  },
+  alertTimerText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700'
+  },
+  alertMessageText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    marginTop: 6,
+    lineHeight: 18
+  },
+  ackButton: {
+    marginTop: 12,
+    backgroundColor: '#D4FF47',
+    borderRadius: 12,
+    paddingVertical: 11,
+    alignItems: 'center'
+  },
+  ackButtonText: {
+    color: '#0A0D0A',
+    fontSize: 13,
+    fontWeight: '700'
+  },
   heroCard: {
-    borderRadius: 24,
-    padding: 20
+    borderRadius: 26,
+    padding: 22
   },
   heroMetaRow: {
     flexDirection: 'row',
@@ -809,62 +949,61 @@ const styles = StyleSheet.create({
     marginBottom: 10
   },
   heroMetaText: {
-    color: '#0A0D0A',
-    fontSize: 11,
-    fontWeight: '600',
-    letterSpacing: 0.5,
-    opacity: 0.75
+    color: 'rgba(10, 13, 10, 0.65)',
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.6
   },
   heroLabel: {
     color: '#0A0D0A',
-    fontSize: 13,
-    fontWeight: '500',
-    opacity: 0.8
+    fontSize: 14,
+    fontWeight: '600'
   },
   heroMainValue: {
     color: '#0A0D0A',
     fontSize: 54,
-    fontWeight: '300',
+    fontWeight: '700',
     letterSpacing: -2,
-    lineHeight: 60
+    marginVertical: 2
   },
   heroUnit: {
-    color: '#0A0D0A',
+    color: 'rgba(10, 13, 10, 0.72)',
     fontSize: 12,
-    fontWeight: '500',
-    opacity: 0.75,
-    marginBottom: 14
+    fontWeight: '600'
   },
   heroSplitRow: {
     flexDirection: 'row',
-    paddingTop: 6
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(10, 13, 10, 0.14)',
+    marginTop: 16,
+    paddingTop: 14
   },
   heroSplitCol: {
     flex: 1
   },
   heroSubLabel: {
-    color: '#0A0D0A',
+    color: 'rgba(10, 13, 10, 0.72)',
     fontSize: 12,
-    fontWeight: '500',
-    opacity: 0.75
+    fontWeight: '600'
   },
   heroSubVal: {
     color: '#0A0D0A',
-    fontSize: 22,
-    fontWeight: '500',
+    fontSize: 28,
+    fontWeight: '700',
+    letterSpacing: -0.8,
     marginTop: 2
   },
   heroSubUnit: {
-    color: '#0A0D0A',
+    color: 'rgba(10, 13, 10, 0.68)',
     fontSize: 11,
-    opacity: 0.75
+    fontWeight: '600'
   },
   surfaceCard: {
     backgroundColor: '#141417',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.06)',
     borderRadius: 22,
-    padding: 16
+    padding: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.06)'
   },
   cardTopRow: {
     flexDirection: 'row',
@@ -883,16 +1022,16 @@ const styles = StyleSheet.create({
   },
   redHighlight: {
     color: '#FF4D4D',
-    fontWeight: '600'
+    fontWeight: '700'
   },
   chartWrapper: {
-    height: 84,
-    width: '100%'
+    height: 86,
+    marginVertical: 4
   },
   chartAxisRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginTop: 6
+    marginTop: 4
   },
   axisLabel: {
     color: '#5C5C66',
@@ -911,12 +1050,13 @@ const styles = StyleSheet.create({
   },
   ringCenterText: {
     position: 'absolute',
-    alignItems: 'center'
+    alignItems: 'center',
+    justifyContent: 'center'
   },
   ringScoreText: {
     color: '#FFFFFF',
     fontSize: 16,
-    fontWeight: '600'
+    fontWeight: '700'
   },
   ringSubText: {
     color: '#8E8E98',
@@ -928,75 +1068,11 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18
   },
-  alertCard: {
-    backgroundColor: 'rgba(255, 77, 77, 0.12)',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 77, 77, 0.45)',
-    borderRadius: 20,
-    padding: 15
-  },
-  alertTopRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 6
-  },
-  alertTitleText: {
-    color: '#FF4D4D',
-    fontSize: 12,
-    fontWeight: '700'
-  },
-  alertTimerText: {
-    color: '#FF4D4D',
-    fontSize: 12,
-    fontWeight: '600'
-  },
-  alertMessageText: {
-    color: '#FFFFFF',
-    fontSize: 13,
-    lineHeight: 18,
-    marginBottom: 10
-  },
-  ackButton: {
-    backgroundColor: '#D4FF47',
-    borderRadius: 12,
-    paddingVertical: 10,
-    alignItems: 'center'
-  },
-  ackButtonText: {
-    color: '#0A0D0A',
-    fontSize: 13,
-    fontWeight: '600'
-  },
-  pillsRow: {
-    flexDirection: 'row',
-    gap: 8,
-    paddingVertical: 4
-  },
-  scenarioPill: {
-    backgroundColor: '#141417',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.06)',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 999
-  },
-  scenarioPillActive: {
-    backgroundColor: '#D4FF47',
-    borderColor: '#D4FF47'
-  },
-  scenarioPillText: {
-    color: '#8E8E98',
-    fontSize: 12,
-    fontWeight: '500'
-  },
-  scenarioPillTextActive: {
-    color: '#0A0D0A',
-    fontWeight: '600'
-  },
   sectionRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 10
+    marginBottom: 10,
+    paddingHorizontal: 2
   },
   sectionSub: {
     color: '#8E8E98',
@@ -1004,14 +1080,15 @@ const styles = StyleSheet.create({
   },
   listRowCard: {
     backgroundColor: '#141417',
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.06)',
-    borderRadius: 18,
-    padding: 14,
-    marginBottom: 8,
+    borderColor: 'rgba(255, 255, 255, 0.06)',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center'
+    alignItems: 'center',
+    marginBottom: 8
   },
   listRowPrimary: {
     color: '#FFFFFF',
@@ -1021,58 +1098,57 @@ const styles = StyleSheet.create({
   listRowSecondary: {
     color: '#8E8E98',
     fontSize: 12,
-    marginTop: 2
+    marginTop: 3
   },
   statusTag: {
     fontSize: 12,
     fontWeight: '600'
   },
   inputField: {
-    backgroundColor: '#08080A',
+    backgroundColor: '#1C1C21',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
+    borderColor: 'rgba(255,255,255,0.06)',
     borderRadius: 12,
     color: '#FFFFFF',
-    paddingHorizontal: 12,
+    paddingHorizontal: 14,
     paddingVertical: 10,
     fontSize: 13,
-    marginBottom: 8
+    marginBottom: 10
   },
   overlineVolt: {
     color: '#D4FF47',
     fontSize: 11,
-    fontWeight: '600',
-    letterSpacing: 0.5
+    fontWeight: '700',
+    letterSpacing: 0.7,
+    marginBottom: 4
   },
   docName: {
     color: '#FFFFFF',
     fontSize: 17,
     fontWeight: '600',
-    marginTop: 4
+    marginBottom: 4
   },
   bottomPillNav: {
     position: 'absolute',
-    bottom: 20,
-    left: 20,
-    right: 20,
-    height: 58,
-    backgroundColor: 'rgba(20, 20, 23, 0.94)',
+    bottom: 18,
+    left: 24,
+    right: 24,
+    backgroundColor: 'rgba(22, 22, 26, 0.96)',
     borderRadius: 999,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
+    padding: 6,
     flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-around',
-    paddingHorizontal: 8
+    justifyContent: 'space-between',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)'
   },
   navPillItem: {
-    width: 50,
-    height: 40,
+    flex: 1,
+    height: 42,
     borderRadius: 999,
     alignItems: 'center',
     justifyContent: 'center'
   },
   navPillItemActive: {
-    backgroundColor: 'rgba(212, 255, 71, 0.16)'
+    backgroundColor: '#26262C'
   }
 });

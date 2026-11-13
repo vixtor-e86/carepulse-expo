@@ -2,16 +2,11 @@ import * as SQLite from 'expo-sqlite';
 
 let dbInstance = null;
 
-// In-memory fallback if running in an environment where native SQLite is unavailable
+// In-memory fallback with zero mock readings
 const memoryStore = {
-  readings: [
-    { id: 1, heart_rate: 74, spo2: 98.4, temperature: 36.6, source: 'watch_ble', recorded_at: new Date().toISOString() }
-  ],
+  readings: [],
   alerts: [],
-  contacts: [
-    { id: 1, name: 'Eleanor Doe', relationship: 'Spouse', phone: '+1-555-0143', is_primary: 1 },
-    { id: 2, name: 'Michael Doe', relationship: 'Brother', phone: '+1-555-0188', is_primary: 0 }
-  ],
+  contacts: [],
   settings: {
     backend_url: 'http://192.168.137.1:8000'
   }
@@ -53,30 +48,25 @@ export async function getDb() {
       );
     `);
 
-    const countRow = await dbInstance.getFirstAsync('SELECT COUNT(*) as cnt FROM emergency_contacts');
-    if (!countRow || countRow.cnt === 0) {
-      await dbInstance.runAsync(
-        'INSERT INTO emergency_contacts (name, relationship, phone, is_primary) VALUES (?, ?, ?, ?)',
-        ['Eleanor Doe', 'Spouse', '+1-555-0143', 1]
-      );
-      await dbInstance.runAsync(
-        'INSERT INTO emergency_contacts (name, relationship, phone, is_primary) VALUES (?, ?, ?, ?)',
-        ['Michael Doe', 'Brother', '+1-555-0188', 0]
-      );
-    }
-
-    const rCount = await dbInstance.getFirstAsync('SELECT COUNT(*) as cnt FROM readings');
-    if (!rCount || rCount.cnt === 0) {
-      await dbInstance.runAsync(
-        'INSERT INTO readings (heart_rate, spo2, temperature, source, recorded_at) VALUES (?, ?, ?, ?, ?)',
-        [74, 98.4, 36.6, 'watch_ble', new Date().toISOString()]
-      );
-    }
+    // Purge any previously seeded mock or scenario rows so only real hardware watch data exists
+    await dbInstance.runAsync(
+      "DELETE FROM readings WHERE (heart_rate = 74 AND spo2 = 98.4 AND temperature = 36.6) OR source = 'scenario'"
+    );
 
     return dbInstance;
   } catch (err) {
     return null;
   }
+}
+
+export async function clearLocalReadings() {
+  const db = await getDb();
+  if (db) {
+    await db.runAsync('DELETE FROM readings');
+    await db.runAsync('DELETE FROM alerts');
+  }
+  memoryStore.readings = [];
+  memoryStore.alerts = [];
 }
 
 export async function saveLocalReading(heartRate, spo2, temperature, source = 'watch_ble', finger = true) {
@@ -85,18 +75,25 @@ export async function saveLocalReading(heartRate, spo2, temperature, source = 'w
 
   let newAlert = null;
   const violations = [];
-  if (finger) {
+  if (finger && heartRate > 0) {
     if (heartRate > 110) violations.push(`Elevated Heart Rate (${heartRate} bpm)`);
     else if (heartRate < 50) violations.push(`Low Heart Rate (${heartRate} bpm)`);
-    if (spo2 < 92.0) violations.push(`Low Blood Oxygen (${spo2.toFixed(1)}%)`);
-    if (temperature > 38.0) violations.push(`Elevated Temperature (${temperature.toFixed(1)}°C)`);
+    if (spo2 > 0 && spo2 < 92.0) violations.push(`Low Blood Oxygen (${spo2.toFixed(1)}%)`);
+  }
+  if (temperature > 38.0) {
+    violations.push(`Elevated Temperature (${temperature.toFixed(1)}°C)`);
   }
 
+  // Only persist readings to history when the watch sensor has a valid measurement
+  const shouldSaveRow = (finger && heartRate > 0) || temperature > 0;
+
   if (db) {
-    await db.runAsync(
-      'INSERT INTO readings (heart_rate, spo2, temperature, source, recorded_at) VALUES (?, ?, ?, ?, ?)',
-      [Math.round(heartRate), Number(spo2.toFixed(1)), Number(temperature.toFixed(1)), source, nowStr]
-    );
+    if (shouldSaveRow) {
+      await db.runAsync(
+        'INSERT INTO readings (heart_rate, spo2, temperature, source, recorded_at) VALUES (?, ?, ?, ?, ?)',
+        [Math.round(heartRate), Number(spo2.toFixed(1)), Number(temperature.toFixed(1)), source, nowStr]
+      );
+    }
 
     if (violations.length > 0) {
       const existing = await db.getFirstAsync(
@@ -108,7 +105,7 @@ export async function saveLocalReading(heartRate, spo2, temperature, source = 'w
             ? 'MULTIPLE_ANOMALY'
             : heartRate > 110
             ? 'TACHYCARDIA'
-            : spo2 < 92.0
+            : spo2 > 0 && spo2 < 92.0
             ? 'HYPOXEMIA'
             : 'FEVER';
         const msg = violations.join(' · ');
@@ -127,18 +124,20 @@ export async function saveLocalReading(heartRate, spo2, temperature, source = 'w
       }
     }
   } else {
-    memoryStore.readings.unshift({
-      id: Date.now(),
-      heart_rate: Math.round(heartRate),
-      spo2: Number(spo2.toFixed(1)),
-      temperature: Number(temperature.toFixed(1)),
-      source,
-      recorded_at: nowStr
-    });
+    if (shouldSaveRow) {
+      memoryStore.readings.unshift({
+        id: Date.now(),
+        heart_rate: Math.round(heartRate),
+        spo2: Number(spo2.toFixed(1)),
+        temperature: Number(temperature.toFixed(1)),
+        source,
+        recorded_at: nowStr
+      });
+    }
     if (violations.length > 0) {
       newAlert = {
         id: Date.now(),
-        alert_type: heartRate > 110 ? 'TACHYCARDIA' : spo2 < 92 ? 'HYPOXEMIA' : 'FEVER',
+        alert_type: heartRate > 110 ? 'TACHYCARDIA' : spo2 > 0 && spo2 < 92 ? 'HYPOXEMIA' : 'FEVER',
         severity: 'CRITICAL',
         message: violations.join(' · '),
         status: 'PENDING_PATIENT_ACK',
